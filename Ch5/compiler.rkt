@@ -9,105 +9,107 @@
   build-interference allocate-registers
   ; assign-homes
   lower-conditionals
-  patch-instructions print-x86 r2-passes)
+  patch-instructions print-x86 r3-passes)
 
 ; input:  R_2 -> (program exp)
 ; output: R_2 -> (program (type type) exp)
-(define (typecheck p) ((typecheck-R2 `()) p))
+(define (typecheck p) ((typecheck-R3 `()) p))
 
-(define (typecheck-R2 env)
+(define (typecheck-R3 env)
   (lambda (e)
-    (define recur (typecheck-R2 env))
+    (define recur (typecheck-R3 env))
     (match e
-      [(? fixnum?) `Integer]
-      [(? boolean?) `Boolean]
-      [(? symbol?) (lookup e env)]
-      [`(let ([,x ,(app recur T)]) ,body)
-        (define new-env (cons (cons x T) env))
-        ((typecheck-R2 new-env) body)]
-      [`(if ,(app recur cnd) ,(app recur thn) ,(app recur els))
-        (if (type-boolean cnd)
-            (cond
-              [(and (type-boolean thn) (type-boolean els)) `Boolean]
-              [(and (type-integer thn) (type-integer els)) `Integer]
-              [else (error
-                      `typecheck-R2
-                      "`if` branches must return same type ~v" e)])
-            (error `typecheck-R2 "`if` expected a Boolean condition ~v" e))]
-      [`(not ,(app recur T))
-        (if (type-boolean T)
-            `Boolean
-            (error `typecheck-R2 "`not` expected a Boolean ~v" e))]
-      [`(and ,(app recur T1) ,(app recur T2))
+      [(? fixnum?) (values `(has-type ,e Integer) `Integer)]
+      [(? boolean?) (values `(has-type ,e Boolean) `Boolean)]
+      [(? symbol?) (values `(has-type ,e ,(lookup e env)) (lookup e env))]
+      [`(let ([,x ,(app recur let_e let_T)]) ,body)
+        (define new-env (cons (cons x let_T) env))
+        (define-values (body_e body_T) ((typecheck-R3 new-env) body))
+        (values
+          `(let ([,x (has-type ,let_e ,let_T)]) ,body_e)
+          body_T)]
+      [`(if ,(app recur cnd_e cnd_T)
+            ,(app recur thn_e thn_T)
+            ,(app recur els_e els_T))
+        (unless (type-boolean cnd_T)
+          (error `typecheck-R3 "`if` expected a Boolean condition ~v" e))
+        (define if_e `(if ,cnd_e ,thn_e ,els_e))
+        (if (equal? thn_T els_T)
+            (values if_e thn_T)
+            (error `typecheck-R3 "`if` branches must return same type ~v" e))]
+      [`(not ,(app recur not_e not_T))
+        (if (type-boolean not_T)
+            (values `(not ,not_e) `Boolean)
+            (error `typecheck-R3 "`not` expected a Boolean ~v" e))]
+      [`(and ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-boolean T1) (type-boolean T2))
-            `Boolean
-            (error `typecheck-R2 "`and` expected a Boolean ~v" e))]
+            (values `(and ,e1 ,e2) `Boolean)
+            (error `typecheck-R3 "`and` expected a Boolean ~v" e))]
       [`(void) (values `(has-type (void) Void) `Void)]
-      [`(vector ,(app (type-check env) e* t*) ...)
+      [`(vector ,(app recur e* t*) ...)
         (let ([t `(Vector ,@t*)])
           (values `(has-type (vector ,@e*) ,t) t))]
-      [`(vector-ref ,(app (type-check env) e t) ,i)
+      [`(vector-ref ,(app recur e t) ,i)
         (match t
           [`(Vector ,ts ...)
             (unless (and (exact-nonnegative-integer? i)
                           (i . < . (length ts)))
-              (error `type-check "invalid index ~a" i))
+              (error `typecheck-R3 "invalid index ~a" i))
             (let ([t (list-ref ts i)])
-                  (values `(has-type (vector-ref ,e (has-type ,i Integer)) ,t)
-                      t))]
+                  (values
+                    `(has-type (vector-ref ,e (has-type ,i Integer)) ,t)
+                    t))]
           [else (error "expected a vector in vector-ref, not" t)])]
-      [`(vector-set! ,(app (type-check env) e-vec^ t-vec) ,i
-                     ,(app (type-check env) e-arg^ t-arg))
+      [`(vector-set! ,(app recur e-vec^ t-vec)
+                     ,i
+                     ,(app recur e-arg^ t-arg))
         (match t-vec
           [`(Vector ,ts ...)
             (unless (and (exact-nonnegative-integer? i)
                          (i . < . (length ts)))
-              (error `type-check "invalid index ~a" i))
+              (error `typecheck-R3 "invalid index ~a" i))
             (unless (equal? (list-ref ts i) t-arg)
-              (error `type-check "type mismatch in vector-set! ~a ~a"
+              (error `typecheck-R3 "type mismatch in vector-set! ~a ~a"
                 (list-ref ts i) t-arg))
             (values `(has-type (vector-set! ,e-vec^
                                 (has-type ,i Integer)
                                 ,e-arg^) Void) `Void)]
-          [else (error `type-check
+          [else (error `typecheck-R3
                   "expected a vector in vector-set!, not ~a" t-vec)])]
-      [`(eq? ,(app recur T1) ,(app recur T2))
-        (cond
-          [(and (type-integer T1) (type-integer T2)) `Boolean]
-          [(and (type-boolean T1) (type-boolean T2)) `Boolean]
-          [else (error
-                  `typecheck-R2
-                  "`eq?` has Boolean first argument but non-Boolean second~s~v"
-                  " argument" e)]
-        )]
-      [`(< ,(app recur T1) ,(app recur T2))
+      [`(eq? ,(app recur e1 T1) ,(app recur e2 T2))
+        (if (equal? T1 T2)
+            (values `(has-type (eq? ,e1 ,e2) Boolean) `Boolean)
+            (error
+              `typecheck-R3
+              "`eq?` nonequal argument types ~v" e))]
+      [`(< ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-integer T1) (type-integer T2))
-            `Boolean
-            (error `typecheck-R2 "`<` expected Integer arguments ~v" e))]
-      [`(<= ,(app recur T1) ,(app recur T2))
+            (values `(has-type (< ,e1 ,e2) Boolean) `Boolean)
+            (error `typecheck-R3 "`<` expected Integer arguments ~v" e))]
+      [`(<= ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-integer T1) (type-integer T2))
-            `Boolean
-            (error `typecheck-R2 "`<=` expected Integer arguments ~v" e))]
-      [`(> ,(app recur T1) ,(app recur T2))
+            (values `(has-type (<= ,e1 ,e2) Boolean) `Boolean)
+            (error `typecheck-R3 "`<=` expected Integer arguments ~v" e))]
+      [`(> ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-integer T1) (type-integer T2))
-            `Boolean
-            (error `typecheck-R2 "`>` expected Integer arguments ~v" e))]
-      [`(>= ,(app recur T1) ,(app recur T2))
+            (values `(has-type (> ,e1 ,e2) Boolean) `Boolean)
+            (error `typecheck-R3 "`>` expected Integer arguments ~v" e))]
+      [`(>= ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-integer T1) (type-integer T2))
-            `Boolean
-            (error `typecheck-R2 "`>=` expected Integer arguments ~v" e))]
-      [`(+ ,(app recur T1) ,(app recur T2))
+            (values `(has-type (>= ,e1 ,e2) Boolean) `Boolean)
+            (error `typecheck-R3 "`>=` expected Integer arguments ~v" e))]
+      [`(+ ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-integer T1) (type-integer T2))
-            `Integer
-            (error `typecheck-R2 "`+` expected Integer arguments ~v" e))]
-      [`(- ,(app recur T1))
+            (values `(has-type (+ ,e1 ,e2) Integer) `Integer)
+            (error `typecheck-R3 "`+` expected Integer arguments ~v" e))]
+      [`(- ,(app recur e1 T1))
         (if (type-integer T1)
-            `Integer
-            (error `typecheck-R2 "`-` expected Integer argument ~v" e))]
-      [`(read) `Integer]
+            (values `(has-type (- ,e1) Integer) `Integer)
+            (error `typecheck-R3 "`-` expected Integer argument ~v" e))]
+      [`(read) (values `(has-type (read) Integer) `Integer)]
       [`(program ,body)
-        (define ty ((typecheck-R2 `()) body))
-        `(program (type ,ty) ,body)]
+        (define-values (body_e body_T) ((typecheck-R3 `()) body))
+        `(program (type ,body_T) ,body_e)]
       )))
 
 (define (type-boolean T)
@@ -768,17 +770,17 @@
     [else (error `print-x86 "invalid grammar ~v" e)]
   ))
 
-(define r2-passes
+(define r3-passes
   `(
      ; ("typecheck" ,typecheck ,interp-scheme)
-     ("uniquify" ,uniquify ,interp-scheme)
-     ("flatten" ,flatten-R2 ,interp-C)
-     ("select-instructions" ,select-instructions ,interp-x86)
-     ("uncover-live" ,uncover-live ,interp-x86)
-     ("build-interference" ,build-interference ,interp-x86)
-     ("allocate-registers" ,allocate-registers ,interp-x86)
+     ; ("uniquify" ,uniquify ,interp-scheme)
+     ; ("flatten" ,flatten-R2 ,interp-C)
+     ; ("select-instructions" ,select-instructions ,interp-x86)
+     ; ("uncover-live" ,uncover-live ,interp-x86)
+     ; ("build-interference" ,build-interference ,interp-x86)
+     ; ("allocate-registers" ,allocate-registers ,interp-x86)
      ; ("assign-homes" ,assign-homes ,interp-x86)
-     ("lower-conditionals" ,lower-conditionals ,interp-x86)
-     ("patch-instructions" ,patch-instructions ,interp-x86)
-     ("print-x86" ,print-x86 #f)
+     ; ("lower-conditionals" ,lower-conditionals ,interp-x86)
+     ; ("patch-instructions" ,patch-instructions ,interp-x86)
+     ; ("print-x86" ,print-x86 #f)
   ))
