@@ -5,14 +5,16 @@
 (require "interp.rkt")
 
 (provide
-  typecheck uniquify flatten-R2 select-instructions uncover-live
+  typecheck uniquify
+  expose-allocation
+  flatten-R2 select-instructions uncover-live
   build-interference allocate-registers
   ; assign-homes
   lower-conditionals
   patch-instructions print-x86 r3-passes)
 
-; input:  R_2 -> (program exp)
-; output: R_2 -> (program (type type) exp)
+; input:  (program exp)
+; output: (program (type type) exp)
 (define (typecheck p) ((typecheck-R3 `()) p))
 
 (define (typecheck-R3 env)
@@ -26,7 +28,7 @@
         (define new-env (cons (cons x let_T) env))
         (define-values (body_e body_T) ((typecheck-R3 new-env) body))
         (values
-          `(let ([,x (has-type ,let_e ,let_T)]) ,body_e)
+          `(has-type (let ([,x ,let_e]) ,body_e) ,body_T)
           body_T)]
       [`(if ,(app recur cnd_e cnd_T)
             ,(app recur thn_e thn_T)
@@ -35,15 +37,15 @@
           (error `typecheck-R3 "`if` expected a Boolean condition ~v" e))
         (define if_e `(if ,cnd_e ,thn_e ,els_e))
         (if (equal? thn_T els_T)
-            (values if_e thn_T)
+            (values `(has-type ,if_e ,thn_T) thn_T)
             (error `typecheck-R3 "`if` branches must return same type ~v" e))]
       [`(not ,(app recur not_e not_T))
         (if (type-boolean not_T)
-            (values `(not ,not_e) `Boolean)
+            (values `(has-type (not ,not_e) Boolean) `Boolean)
             (error `typecheck-R3 "`not` expected a Boolean ~v" e))]
       [`(and ,(app recur e1 T1) ,(app recur e2 T2))
         (if (and (type-boolean T1) (type-boolean T2))
-            (values `(and ,e1 ,e2) `Boolean)
+            (values `(has-type (and ,e1 ,e2) Boolean) `Boolean)
             (error `typecheck-R3 "`and` expected a Boolean ~v" e))]
       [`(void) (values `(has-type (void) Void) `Void)]
       [`(vector ,(app recur e* t*) ...)
@@ -122,8 +124,8 @@
     [`Integer #t]
     [else #f]))
 
-; input:  R_2 -> (program (type type) exp)
-; output: R_2 -> (program (type type) exp)
+; input:  (program (type type) exp)
+; output: (program (type type) exp)
 (define (uniquify p)
   ((uniquify-r '()) p))
 
@@ -145,9 +147,142 @@
        `(program
           (type ,t)
           ,((uniquify-r alist) e))]
+      [`(has-type ,exp ,T)
+        `(has-type ,((uniquify-r alist) exp) ,T)]
       [`(,op ,es ...)
        `(,op ,@(map (uniquify-r alist) es))]
       [else (error `uniquify-r "uniquify-r couldn't match ~v" e)])))
+
+; input:  (program (type type) exp)
+; output: (program (type type) exp)
+(define (expose-allocation e)
+  (match e
+    [`(has-type ,exp ,T)
+      (list `has-type
+        (match exp
+          [(? fixnum?) exp]
+          [(? boolean?) exp]
+          [(? symbol?) exp]
+          [`(void) exp]
+          [`(vector ,(app expose-allocation e_n) ...)
+            (define v_sym (gensym `v))
+            (cond
+              [(empty? e_n)
+              `(has-type
+                (let ([_ (has-type
+                  (if (has-type
+                    (< (has-type
+                      (+ (has-type
+                        (global-value free_ptr)
+                        Integer)
+                        (has-type 8 Integer))
+                      Integer)
+                      (has-type
+                        (global-value fromspace_end)
+                        Integer))
+                    Boolean)
+                    (has-type (void) Void)
+                    (has-type (collect 8) Void))
+                  Void)])
+                  (has-type
+                    (let ([,v_sym (has-type
+                      (allocate 0 ,T)
+                      ,T)])
+                      (has-type ,v_sym ,T))
+                    Void))
+                Void)]
+              [else
+                (define vm (vector-var-mapping e_n))
+                (define bytes (+ 8 (* 8 (length e_n))))
+                (define space-check
+                  `(has-type
+                    (let ([_ (has-type
+                      (if (has-type
+                            (< (has-type
+                                (+ (has-type
+                                    (global-value free_ptr)
+                                    Integer)
+                                   (has-type ,bytes Integer))
+                                Integer)
+                              (has-type (global-value fromspace_end) Integer))
+                            Boolean)
+                        (has-type (void) Void)
+                        (has-type (collect (has-type ,bytes Integer)) Void))
+                        Void)])
+                      (has-type
+                        (let ([,v_sym 
+                          (has-type
+                            (allocate
+                              ,(length e_n)
+                              ,T) ; wrap type in a has-type ???
+                            ,T)])
+                        ,(vector-set-lets vm e_n v_sym T))
+                        Void))
+                    Void))
+                (mapping-to-lets vm e_n space-check)])]
+          [`(let ([,x ,(app expose-allocation let_e)])
+              ,(app expose-allocation body_e))
+            `(let ([,x ,let_e]) ,body_e)]
+          [`(if ,(app expose-allocation cnd_e)
+                ,(app expose-allocation thn_e)
+                ,(app expose-allocation els_e))
+            `(if ,cnd_e ,thn_e ,els_e)]
+          [`(read) `(read)]
+          [`(,op ,(app expose-allocation a1)
+                 ,(app expose-allocation a2)
+                 ,(app expose-allocation a3))
+            `(,op ,a1 ,a2 ,a3)]
+          [`(,op ,(app expose-allocation arg1) ,(app expose-allocation arg2))
+            `(,op ,arg1 ,arg2)]
+          [`(,op ,(app expose-allocation arg))
+            `(,op ,arg)]
+          [else (error `expose-allocation "invalid exp syntax ~v" exp)])
+        T)]
+    [`(program (type ,type) ,body ...)
+      `(program (type ,type) ,@(map expose-allocation body))]
+    [else (error `expose-allocation "invalid syntax ~v" e)]))
+
+(define (vector-var-mapping vals)
+  (define m (make-hash))
+  (map (lambda (v) (hash-set! m v (gensym `x))) vals)
+  m)
+
+(define (mapping-to-lets m vals body)
+  (define vals-r (reverse vals))
+  (let f ([output `(let ([,(hash-ref m (car vals-r)) ,(car vals-r)]) ,body)]
+          [v (cdr vals-r)])
+    (if (empty? v)
+        output
+        (f (list
+            `let
+            `([,(hash-ref m (car v)) ,(car v)])
+            output)
+          (cdr v)))))
+
+(define (vector-set-lets m vals v_sym T)
+  (define vals-r (reverse vals))
+  (let f ([output
+            `(has-type
+              (let ([_ (has-type (vector-set!
+                (has-type ,v_sym ,T)
+                (has-type ,(- (length vals) 1) Integer)
+                (has-type ,(hash-ref m (car vals-r)) (last T))) Void)])
+                (has-type ,v_sym ,T))
+              Void)]
+          [v (cdr vals-r)]
+          [n (- (length vals) 2)]
+          [types (cdr (reverse (cdr T)))])
+    (if (empty? v)
+      output
+      (f `(has-type (let
+        ([_ (has-type (vector-set!
+            (has-type ,v_sym ,T)
+            (has-type ,n Integer)
+            (has-type ,(hash-ref m (car v)) (car types))) Void)])
+          ,output) Void)
+        (cdr v)
+        (- n 1)
+        (cdr types)))))
 
 ; input:  R_2 -> (program (type type) exp)
 ; output: C_1 -> (program (var*) (type type) stmt+)
@@ -773,7 +908,8 @@
 (define r3-passes
   `(
      ; ("typecheck" ,typecheck ,interp-scheme)
-     ; ("uniquify" ,uniquify ,interp-scheme)
+     ("uniquify" ,uniquify ,interp-scheme)
+     ("expose-allocation" ,expose-allocation ,interp-scheme)
      ; ("flatten" ,flatten-R2 ,interp-C)
      ; ("select-instructions" ,select-instructions ,interp-x86)
      ; ("uncover-live" ,uncover-live ,interp-x86)
