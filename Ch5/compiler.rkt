@@ -7,7 +7,7 @@
 (provide
   typecheck uniquify
   expose-allocation
-  flatten-R2 select-instructions uncover-live
+  flatten select-instructions uncover-live
   build-interference allocate-registers
   ; assign-homes
   lower-conditionals
@@ -284,28 +284,38 @@
         (- n 1)
         (cdr types)))))
 
-; input:  R_2 -> (program (type type) exp)
-; output: C_1 -> (program (var*) (type type) stmt+)
-(define (flatten-R2 p)
+; input:  (program (type type) exp)
+; output: (program ([(var . type)|(var Vector type*)]*) (type type) stmt+)
+(define (flatten p)
   ((flatten-r #f) p))
 
 (define (flatten-r use-temp)
   (lambda (e)
     (match e
+      [`(program (type ,t) ,body)
+        (define-values
+          (e-flat e-assigns e-vars)
+          ((flatten-r #t) body))
+        (append
+          `(program ,e-vars (type ,t))
+          (append e-assigns `((return ,e-flat))))]
+      [`(has-type ,exp ,T) ((flatten-r use-temp) exp)]
       [(? symbol?) (values e `() `())]
       [(? integer?) (values e `() `())]
       [(? boolean?) (values e `() `())]
       [`(let ([,x ,v]) ,body)
-        (define-values
-          (v-flat v-assigns v-vars)
-          ((flatten-r #f) v))
-        (define-values
-          (body-flat body-assigns body-vars)
-          ((flatten-r use-temp) body))
-        (values
-          body-flat
-          (append v-assigns `((assign ,x ,v-flat)) body-assigns)
-          (append v-vars (list x) body-vars))]
+        (match v
+          [`(has-type ,v-exp ,v-type)
+            (define-values
+              (v-flat v-assigns v-vars)
+              ((flatten-r #f) v-exp))
+            (define-values
+              (body-flat body-assigns body-vars)
+              ((flatten-r use-temp) body))
+            (values
+              body-flat
+              (append v-assigns `((assign ,x ,v-flat)) body-assigns)
+              (append v-vars (list (cons x v-type)) body-vars))])]
       [`(if ,cnd ,thn ,els)
         (define-values
           (cnd-flat cnd-assigns cnd-vars)
@@ -316,6 +326,9 @@
         (define-values
           (els-flat els-assigns els-vars)
           ((flatten-r #t) els))
+        (define if-type
+          (match thn
+            [`(has-type ,_ ,type) type]))
         (let ([if-var (gensym `if)])
           (values
             if-var
@@ -327,7 +340,7 @@
                 (append
                   els-assigns
                   (list (list `assign if-var els-flat))))))
-            (append cnd-vars (list if-var) thn-vars els-vars)))]
+            (append cnd-vars (list (cons if-var if-type)) thn-vars els-vars)))]
       [`(and ,e1 ,e2)
         (define-values
           (e1-flat e1-assigns e1-vars)
@@ -344,20 +357,31 @@
                 e2-assigns
                 (list (list `assign if-var e2-flat)))
               (list (list `assign if-var #f)))))
-          (append e1-vars (list if-var) e2-vars)
+          (append e1-vars (list (cons if-var `Boolean)) e2-vars)
         )]
-      [`(program
-         (type ,t)
-         ,body)
-        (define-values
-          (e-flat e-assigns e-vars)
-          ((flatten-r #t) body))
-        (append
-          `(program
-            ,e-vars
-            (type ,t)
-            )
-          (append e-assigns `((return ,e-flat))))]
+      [`(allocate ,size ,type)
+        (define tmpSym (gensym `tmp))
+        (values
+          tmpSym
+          `((assign ,tmpSym ,e))
+          (list (cons tmpSym type)))]
+      [`(vector-ref ,arg ,i-has-type)
+        (match arg
+          [`(has-type ,arg-exp ,arg-type)
+            (define-values
+              (arg-flat arg-assigns arg-vars)
+              ((flatten-r #t) arg-exp))
+            (define tmpSym (gensym `tmp))
+            (define i
+              (match i-has-type
+                [`(has-type ,num ,_) num]))
+            (define stmt `(vector-ref ,arg-flat ,i))
+            (define stmt-type (list-ref arg-type (+ i 1)))
+            (values
+              tmpSym
+              (append arg-assigns `((assign ,tmpSym ,stmt)))
+              (cons (cons tmpSym stmt-type) arg-vars))
+            ])]
       [`(,op ,es ...)
         (define-values
           (es-flat es-assigns-list es-vars-list)
@@ -371,7 +395,7 @@
                 (values
                   tmpSym
                   (append es-assigns `((assign ,tmpSym ,stmt)))
-                  (cons tmpSym es-vars)))]
+                  (cons (cons tmpSym (op-return-type op)) es-vars)))]
             [else
               (values
                 stmt
@@ -379,6 +403,12 @@
                 es-vars)]))]
       [else (error `flatten-r "flatten could not match ~v" e)]
     )))
+
+(define (op-return-type op)
+  (match op
+    [(or `+ `- `read `global-value) `Integer]
+    [(or `eq? `< `<= `> `>= `not) `Boolean]
+    [(or `vector-set! `void `collect) `Void]))
 
 ; input:  C_1   -> (program (var*) (type type) stmt+)
 ; output: x86_1 -> (program (var*) (type type) instr+)
@@ -910,7 +940,7 @@
      ; ("typecheck" ,typecheck ,interp-scheme)
      ("uniquify" ,uniquify ,interp-scheme)
      ("expose-allocation" ,expose-allocation ,interp-scheme)
-     ; ("flatten" ,flatten-R2 ,interp-C)
+     ("flatten" ,flatten ,interp-C)
      ; ("select-instructions" ,select-instructions ,interp-x86)
      ; ("uncover-live" ,uncover-live ,interp-x86)
      ; ("build-interference" ,build-interference ,interp-x86)
