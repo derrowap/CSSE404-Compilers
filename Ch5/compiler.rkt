@@ -911,7 +911,8 @@
 
 (define (stack-ref? arg)
   (match arg
-    [`(deref rbp ,num) #t]
+    [`(deref ,_ ,_) #t]
+    [`(global-value ,_) #t]
     [else #f]))
 
 ; input:  x86_1 -> (program stack-size (type type) instr+)
@@ -929,10 +930,10 @@
               "    subq    $" (format "~a" size) ", %rsp\n")
             "")
         "    pushq   %rbx\n"
-        "    movq    $16384, %rdi\n"
-        "    movq    $16, %rsi\n"
-        "    callq   _initialize\n"
-        "    movq    _rootstack_begin(%rip), %r15\n"
+        "    movq    $64, %rdi\n"
+        "    movq    $512, %rsi\n"
+        "    callq   initialize\n"
+        "    movq    rootstack_begin(%rip), %r15\n"
         "    movq    $0, (%r15)\n"
         ; "    addq    $0, %r15\n"
         "\n    "
@@ -984,7 +985,7 @@
     [`(deref ,reg ,offset)
       (format "~a(%~a)" offset reg)]
     [`(global-value ,name)
-      (format "_~a(%rip)" name)]
+      (format "~a(%rip)" name)]
     [else (error `print-x86 "invalid grammar ~v" e)]
   ))
 
