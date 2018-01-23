@@ -410,8 +410,8 @@
     [(or `eq? `< `<= `> `>= `not) `Boolean]
     [(or `vector-set! `void `collect) `Void]))
 
-; input:  C_1   -> (program (var*) (type type) stmt+)
-; output: x86_1 -> (program (var*) (type type) instr+)
+; input:  (program ([(var . type)|(var Vector type*)]*) (type type) stmt+)
+; output: (program (var*) (type type) instr+)
 (define (select-instructions e)
   (match e
     [`(assign ,var ,exp)
@@ -478,6 +478,25 @@
           `((cmpq ,a2 ,a1)
             (set ge (byte-reg al))
             (movzbq (byte-reg al) (var ,var)))]
+        [`(vector-ref ,vec ,n)
+          `((movq (var ,vec) (reg r11))
+            (movq (deref r11 ,(* 8 (+ n 1))) (var ,var)))]
+        [`(vector-set! ,vec ,n ,arg)
+          `((movq (var ,vec) (reg r11))
+            (movq ,(C1->x86 arg) (deref r11 ,(* 8 (+ n 1))))
+            (movq (int 0) (var ,var)))]
+        [`(allocate ,len (Vector ,types ...))
+          (define tag (compute-tag len types))
+          `((movq (global-value free_ptr) (var ,var))
+            (addq (int ,(* 8 (+ len 1))) (global-value free_ptr))
+            (movq (var ,var) (reg r11))
+            (movq (int ,tag) (deref r11 0)))]
+        [`(collect ,bytes)
+          `((movq (reg r15) (reg rdi))
+            (movq (int ,bytes) (reg rsi))
+            (callq collect))]
+        [`(void) `((movq (int 0) (var ,var)))]
+        [`(global-value ,name) `((movq (global-value ,name) (var ,var)))]
       )]
     [`(return ,arg)
       (define a (C1->x86 arg))
@@ -493,6 +512,22 @@
         (type ,t)
         ,@(append* (map select-instructions body)))]
     ))
+
+(define (compute-tag len types)
+  ; (((0 + mask) << 6) + len) << 1
+  (arithmetic-shift
+    (+
+      (arithmetic-shift
+        (let mask-loop ([mask 0] [t types])
+          (cond
+            [(empty? t) mask]
+            [(list? (car t))
+              (mask-loop (+ 1 (arithmetic-shift mask 1)) (cdr t))]
+            [else (mask-loop (arithmetic-shift mask 1) (cdr t))]))
+        6)
+      len)
+    1))
+
 
 (define (C1->x86 d)
   (cond
@@ -626,14 +661,16 @@
     [`(reg ,_) current-live]
     [`(int ,_) current-live]
     [`(byte-reg ,_) current-live]
+    [`(deref ,_ ,_) current-live]
+    [`(global-value ,_) current-live]
     [else (error `add-live-vars "invalid argument syntax ~v" arg)]))
 
-; input:  x86_1 -> (program (var* live-afters) (type type) instr+)
-; output: x86_1 -> (program (var* graph) (type type) instr+)
+; input:  (program (var* live-afters) (type type) instr+)
+; output: (program (var* graph) (type type) instr+)
 (define (build-interference p)
   (match p
     [`(program (,vars ,live-afters) (type ,type) ,body ...)
-      (let ([graph (make-graph vars)])
+      (let ([graph (make-graph (map car vars))])
         (map
           (lambda (i l) (build-interference-r i l graph))
           body
@@ -652,37 +689,37 @@
     [`(movq ,a1 ,a2)
       (let ([s (arg->var a1)] [d (arg->var a2)])
         (map (lambda (v)
-          (unless (or (equal? v s) (equal? v d))
+          (unless (or (equal? v s) (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(movzbq ,a1 ,a2)
       (let ([s (arg->var a1)] [d (arg->var a2)])
         (map (lambda (v)
-          (unless (or (equal? v s) (equal? v d))
+          (unless (or (equal? v s) (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(addq ,_ ,a2)
       (let ([d (arg->var a2)])
         (map (lambda (v)
-          (unless (equal? v d)
+          (unless (or (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(subq ,_ ,a2)
       (let ([d (arg->var a2)])
         (map (lambda (v)
-          (unless (equal? v d)
+          (unless (or (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(negq ,arg)
       (let ([d (arg->var arg)])
         (map (lambda (v)
-          (unless (equal? v d)
+          (unless (or (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(xorq ,_ ,a2)
       (let ([d (arg->var a2)])
         (map (lambda (v)
-          (unless (equal? v d)
+          (unless (or (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
     [`(cmpq ,_ ,_) "no graph changes needed"]
@@ -711,7 +748,8 @@
 (define (allocate-registers p)
   (match p
     [`(program (,var ,graph) (type ,type) ,body ...)
-      (let ([color-map (color-graph graph var)]
+      ; (println var)
+      (let ([color-map (color-graph graph (map car var))]
             [m (make-hash)]
             [max-color 0])
         (map (lambda (v)
@@ -730,7 +768,7 @@
               ; [else (hash-set! m v (list `deref `rbp (* -8 (- color 7))))])
             (when (> color max-color)
               (set! max-color color))))
-          var)
+          (map car var))
         (cons
           `program
           (cons
@@ -791,10 +829,14 @@
 (define (assign-homes-r m)
   (lambda (e)
     (match e
+      ; args
       [`(int ,_) e]
       [`(var ,v) (hash-ref m v)]
       [`(reg ,_) e]
       [`(byte-reg ,_) e]
+      [`(deref ,_ ,_) e]
+      [`(global-value ,_) e]
+      ; instr
       [`(set ,_ ,_) e]
       [`(callq ,_) e]
       [`(if (eq? ,e1 ,e2) ,thn ,els)
@@ -886,22 +928,29 @@
               "    movq    %rsp, %rbp\n"
               "    subq    $" (format "~a" size) ", %rsp\n")
             "")
+        "    pushq   %rbx\n"
+        "    movq    $16384, %rdi\n"
+        "    movq    $16, %rsi\n"
+        "    callq   _initialize\n"
+        "    movq    _rootstack_begin(%rip), %r15\n"
+        "    movq    $0, (%r15)\n"
+        ; "    addq    $0, %r15\n"
         "\n    "
         (string-join (map print-x86 body) "\n") "\n"
         "\n"
-        "    movq    %rax, %rdi\n"
-        (cond
-          [(eq? type `Integer) "    callq   print_int\n"]
-          [(eq? type `Boolean) "    callq   print_bool\n"]
-          [else (error `print-x86 "invalid return type ~v" type)])
+        (print-by-type type)
         "    movq    $0, %rax\n"
+        ; "    subq    $0, %r15\n"
         (if (> size 0)
             (string-append
               "    addq    $" (format "~a" size) ", %rsp\n"
               "    popq    %rbp\n")
             "")
+        "    popq    %rbx\n"
         "    retq"
       )]
+
+    ; instr
     [`(movq ,a1 ,a2)
       (format "    movq    ~a, ~a" (print-x86 a1) (print-x86 a2))]
     [`(addq ,a1 ,a2)
@@ -924,6 +973,8 @@
       (format "~a:" label)]
     [`(callq ,label)
       (format "    callq   ~a" label)]
+
+    ; args
     [`(int ,num)
       (format "$~a" num)]
     [`(reg ,r)
@@ -932,6 +983,8 @@
       (format "%~a" r)]
     [`(deref ,reg ,offset)
       (format "~a(%~a)" offset reg)]
+    [`(global-value ,name)
+      (format "_~a(%rip)" name)]
     [else (error `print-x86 "invalid grammar ~v" e)]
   ))
 
@@ -941,12 +994,12 @@
      ("uniquify" ,uniquify ,interp-scheme)
      ("expose-allocation" ,expose-allocation ,interp-scheme)
      ("flatten" ,flatten ,interp-C)
-     ; ("select-instructions" ,select-instructions ,interp-x86)
-     ; ("uncover-live" ,uncover-live ,interp-x86)
-     ; ("build-interference" ,build-interference ,interp-x86)
-     ; ("allocate-registers" ,allocate-registers ,interp-x86)
+     ("select-instructions" ,select-instructions ,interp-x86)
+     ("uncover-live" ,uncover-live ,interp-x86)
+     ("build-interference" ,build-interference ,interp-x86)
+     ("allocate-registers" ,allocate-registers ,interp-x86)
      ; ("assign-homes" ,assign-homes ,interp-x86)
-     ; ("lower-conditionals" ,lower-conditionals ,interp-x86)
-     ; ("patch-instructions" ,patch-instructions ,interp-x86)
-     ; ("print-x86" ,print-x86 #f)
+     ("lower-conditionals" ,lower-conditionals ,interp-x86)
+     ("patch-instructions" ,patch-instructions ,interp-x86)
+     ("print-x86" ,print-x86 #f)
   ))
