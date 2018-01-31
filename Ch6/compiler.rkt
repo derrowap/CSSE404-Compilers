@@ -19,7 +19,7 @@
 
 (define (typecheck-r env)
   (lambda (e)
-    (println (format "top-exp: ~v" e))
+    ; (println (format "top-exp: ~v" e))
     (define recur (typecheck-r env))
     (match e
       [(? fixnum?) (values `(has-type ,e Integer) `Integer)]
@@ -50,7 +50,7 @@
         (define-values (body_e body_T) ((typecheck-r new-env) body))
         (unless (equal? body_T r) 
           (error `typecheck-r "`define return type doesn't match body ~v" e))
-        (values `(has-type (define (,f ,params ...) : ,r ,body_e) ,r) `(,@(map cddr params) -> ,r))]
+        (values `(has-type (define (,f ,@params) : ,r ,body_e) ,r) `(,@(map cddr params) -> ,r))]
       [`(if ,(app recur cnd_e cnd_T)
             ,(app recur thn_e thn_T)
             ,(app recur els_e els_T))
@@ -132,17 +132,22 @@
             (error `typecheck-r "`-` expected Integer argument ~v" e))]
       [`(read) (values `(has-type (read) Integer) `Integer)]
       [`(program ,body ...)
-        (define my-env (map get-define-env (get-define-stmts body)))
-        (define-values
-          (body_e body_T)
-          (map2
-            (typecheck-r my-env)
-            body))
-        (println "program done")
-        `(program (type ,(last body_T)) ,body_e)]
+        (let* ([my-defines (get-define-stmts body)]
+               [my-stmts (list-tail body (length my-defines))]
+               [my-env (map get-define-env my-defines)])
+          (define-values
+            (defines_e defines_T)
+            (map2 (typecheck-r my-env) my-defines))
+          (define-values
+            (body_e body_T)
+            (map2 (typecheck-r my-env) my-stmts))
+          `(program
+            (type ,(last body_T))
+            (defines ,@defines_e)
+            ,@body_e))]
       [`(,f ,args ...)
-        (println (format "func-exp: ~v" e))
-        (println (format "func-env: ~v" env))
+        ; (println (format "func-exp: ~v" e))
+        ; (println (format "func-env: ~v" env))
         (define-values (args_e args_T) (map2 recur args))
         (define f-types
           (reverse (cddr (reverse (lookup f env)))))
@@ -200,10 +205,12 @@
         (let ([newSym (gensym x)])
           `(let ([,newSym ,((uniquify-r alist) e)])
               ,((uniquify-r (cons (list x newSym) alist)) body)))]
-      [`(program (type ,t) ,e)
+      [`(program (type ,t) ,e ...)
        `(program
           (type ,t)
-          ,((uniquify-r alist) e))]
+          ,@(map (uniquify-r alist) e))]
+      ; [`(define (,f ,params ...) : ,r ,body)
+      ;   ()]
       [`(has-type ,exp ,T)
         `(has-type ,((uniquify-r alist) exp) ,T)]
       [`(,op ,es ...)

@@ -4,7 +4,7 @@
 (require "interp.rkt")
 (require "compiler.rkt")
 
-(debug-level 2)
+(debug-level 0)
 
 (interp-tests
     "R4-compiler"           ; name of compiler
@@ -12,7 +12,7 @@
     r4-passes               ; passes containing methods to test
     interp-scheme           ; interpreter to compare results with
     "r4"                    ; test suite
-    (range 4 5)            ; list of numbers for test suite
+    (range 1 39)            ; list of numbers for test suite
 )
 
 (display "interpreter tests passed!") (newline)
