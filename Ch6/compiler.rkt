@@ -6,12 +6,13 @@
 
 (provide
   typecheck uniquify
-  expose-allocation
+  expose-allocation reveal-functions
   flatten select-instructions uncover-live
   build-interference allocate-registers
   ; assign-homes
   lower-conditionals
-  patch-instructions print-x86 r4-passes)
+  patch-instructions print-x86
+  r4-passes r4-passes-dev r4-passes-e)
 
 ; input:  (program exp)
 ; output: (program (type type) exp)
@@ -19,7 +20,7 @@
 
 (define (typecheck-r env)
   (lambda (e)
-    ; (println (format "top-exp: ~v" e))
+    ; (` (format "top-exp: ~v" e))
     (define recur (typecheck-r env))
     (match e
       [(? fixnum?) (values `(has-type ,e Integer) `Integer)]
@@ -50,7 +51,7 @@
         (define-values (body_e body_T) ((typecheck-r new-env) body))
         (unless (equal? body_T r) 
           (error `typecheck-r "`define return type doesn't match body ~v" e))
-        (values `(has-type (define (,f ,@params) : ,r ,body_e) ,r) `(,@(map cddr params) -> ,r))]
+        (values `(has-type (define (,f ,@params) : ,r ,body_e) (,@(map caddr params) -> ,r)) `(,@(map cddr params) -> ,r))]
       [`(if ,(app recur cnd_e cnd_T)
             ,(app recur thn_e thn_T)
             ,(app recur els_e els_T))
@@ -195,27 +196,98 @@
   (lambda (e)
     (match e
       [(? symbol?)
-       (let ([filtered (filter (lambda (x) (equal? (car x) e)) alist)])
-        (if (empty? filtered)
-            (gensym e)
-            (cadar filtered)))]
+        ; (println (format "e: ~v" e))
+        ; (println (format "alist: ~v" alist))
+        (let ([new-sym (assoc e alist)])
+          (if new-sym (cadr new-sym) e))]
       [(? integer?) e]
       [(? boolean?) e]
-      [`(let ([,x ,e]) ,body)
+      [`(let ([,x ,x-e]) ,body)
+        ; (println (format "let-e: ~v" e))
         (let ([newSym (gensym x)])
-          `(let ([,newSym ,((uniquify-r alist) e)])
+          `(let ([,newSym ,((uniquify-r alist) x-e)])
               ,((uniquify-r (cons (list x newSym) alist)) body)))]
-      [`(program (type ,t) ,e ...)
+      [`(program (type ,t) (defines ,defines ...) ,e)
        `(program
           (type ,t)
-          ,@(map (uniquify-r alist) e))]
-      ; [`(define (,f ,params ...) : ,r ,body)
-      ;   ()]
+          (defines ,@(map (uniquify-r alist) defines))
+          ,((uniquify-r alist) e))]
+      [`(defines ,stmts ...)
+        `(defines ,@(map (uniquify-r alist) stmts))]
+      [`(define (,f ,params ...) : ,r ,body)
+        (let* ([new-syms (map gensym (map car params))]
+               [unique-params (map
+                (lambda (x y)
+                  (list x (cadr y) (caddr y))) new-syms params)]
+               [unique-body
+                ((uniquify-r
+                  (append
+                    (map (lambda (x y) (list (car y) x)) new-syms params)
+                    alist))
+                  body)])
+            `(define (,f ,@unique-params) : ,r ,unique-body)
+          )]
       [`(has-type ,exp ,T)
         `(has-type ,((uniquify-r alist) exp) ,T)]
       [`(,op ,es ...)
-       `(,op ,@(map (uniquify-r alist) es))]
+       `(,((uniquify-r alist) op) ,@(map (uniquify-r alist) es))]
       [else (error `uniquify-r "uniquify-r couldn't match ~v" e)])))
+
+; input:  (program (type type) (defines def*) exp)
+; output: (program (type type) (defines def*) exp)
+(define (reveal-functions e)
+  ((reveal-functions-r (make-hash)) e))
+
+(define (reveal-functions-r funcs)
+  (lambda (e)
+    (define recur (reveal-functions-r funcs))
+    (match e
+      [`(program (type ,type) (defines ,defines ...) ,exp)
+        (map (lambda (d)
+          (match d
+            [`(has-type (define (,f ,_ ...) : ,_ ,_) ,type)
+              (hash-set! funcs f type)]
+            [else (error
+              `reveal-functions "define statement not matched ~v" d)]))
+          defines)
+        `(program (type ,type)
+          (defines
+            ,@(map (reveal-functions-r funcs) defines))
+          ,((reveal-functions-r funcs) exp))]
+      [`(define (,f ,params ...) : ,r ,body)
+        `(define (,f ,@params) : ,r ,(recur body))]
+      [`(has-type ,exp ,T)
+        `(has-type ,(recur exp) ,T)]
+      [`(let ([,x ,e]) ,body)
+        (define new-funcs (hash-copy funcs))
+        (hash-set! new-funcs x (get-type e))
+        `(let ([,x ,(recur e)])
+          ,(if (is-func e)
+            ((reveal-functions-r new-funcs) body)
+            (recur body)))]
+      [(? symbol?)
+        (if (hash-has-key? funcs e )
+            `(function-ref ,e)
+            e)]
+      [(? integer?) e]
+      [(? boolean?) e]
+      [`(,op ,args ...)
+        (if (hash-has-key? funcs op)
+          `(app
+            (has-type (function-ref ,op) ,(hash-ref funcs op))
+            ,@(map recur args))
+          `(,op ,@(map recur args)))]
+      [else (error `reveal-functions "invalid syntax ~v" e)]
+  )))
+
+(define (is-func e)
+  (match e
+    [`(has-type ,_ ,type)
+      (not (not (member `-> type)))]))
+
+(define (get-type e)
+  (match e
+    [`(has-type ,_ ,type) type]))
 
 ; input:  (program (type type) exp)
 ; output: (program (type type) exp)
@@ -292,6 +364,8 @@
                 ,(app expose-allocation els_e))
             `(if ,cnd_e ,thn_e ,els_e)]
           [`(read) `(read)]
+          [`(define (,f ,params ...) : ,r ,(app expose-allocation body))
+            `(define (,f ,@params) : ,r ,body)]
           [`(,op ,(app expose-allocation a1)
                  ,(app expose-allocation a2)
                  ,(app expose-allocation a3))
@@ -302,8 +376,12 @@
             `(,op ,arg)]
           [else (error `expose-allocation "invalid exp syntax ~v" exp)])
         T)]
-    [`(program (type ,type) ,body ...)
-      `(program (type ,type) ,@(map expose-allocation body))]
+
+    [`(program (type ,type) (defines ,defines ...) ,body)
+      `(program
+        (type ,type)
+        (defines ,@(map expose-allocation defines))
+        ,(expose-allocation body))]
     [else (error `expose-allocation "invalid syntax ~v" e)]))
 
 (define (vector-var-mapping vals)
@@ -355,116 +433,127 @@
 
 (define (flatten-r use-temp)
   (lambda (e)
+    (println (format "line: ~v" e))
     (match e
-      [`(program (type ,t) ,body)
+      [`(program (type ,t) (defines ,defines ...) ,body)
         (define-values
           (e-flat e-assigns e-vars)
           ((flatten-r #t) body))
-        (append
-          `(program ,e-vars (type ,t))
-          (append e-assigns `((return ,e-flat))))]
-      [`(has-type ,exp ,T) ((flatten-r use-temp) exp)]
+        `(program ,e-vars
+          (type ,t)
+          (defines ,@(map (flatten-r #t) defines))
+          ,@e-assigns
+          (return ,e-flat))]
       [(? symbol?) (values e `() `())]
-      [(? integer?) (values e `() `())]
-      [(? boolean?) (values e `() `())]
-      [`(let ([,x ,v]) ,body)
-        (match v
-          [`(has-type ,v-exp ,v-type)
+      [`(has-type ,exp ,T)
+        (match exp
+          [(? symbol?) (values exp `() `())]
+          [(? integer?) (values exp `() `())]
+          [(? boolean?) (values exp `() `())]
+          [`(define (,f ,params ...) : ,r ,body)
             (define-values
-              (v-flat v-assigns v-vars)
-              ((flatten-r #f) v-exp))
-            (define-values
-              (body-flat body-assigns body-vars)
+              (b-flat b-assigns b-vars)
               ((flatten-r use-temp) body))
-            (values
-              body-flat
-              (append v-assigns `((assign ,x ,v-flat)) body-assigns)
-              (append v-vars (list (cons x v-type)) body-vars))])]
-      [`(if ,cnd ,thn ,els)
-        (define-values
-          (cnd-flat cnd-assigns cnd-vars)
-          ((flatten-r #t) cnd))
-        (define-values
-          (thn-flat thn-assigns thn-vars)
-          ((flatten-r #t) thn))
-        (define-values
-          (els-flat els-assigns els-vars)
-          ((flatten-r #t) els))
-        (define if-type
-          (match thn
-            [`(has-type ,_ ,type) type]))
-        (let ([if-var (gensym `if)])
-          (values
-            if-var
-            (append cnd-assigns (list
-              (list `if (list `eq? #t cnd-flat)
-                (append
-                  thn-assigns
-                  (list (list `assign if-var thn-flat)))
-                (append
-                  els-assigns
-                  (list (list `assign if-var els-flat))))))
-            (append cnd-vars (list (cons if-var if-type)) thn-vars els-vars)))]
-      [`(and ,e1 ,e2)
-        (define-values
-          (e1-flat e1-assigns e1-vars)
-          ((flatten-r #t) e1))
-        (define-values
-          (e2-flat e2-assigns e2-vars)
-          ((flatten-r #t) e2))
-        (define if-var (gensym `if))
-        (values
-          if-var
-          (append e1-assigns (list
-            (list `if (list `eq? #t e1-flat)
-              (append
-                e2-assigns
-                (list (list `assign if-var e2-flat)))
-              (list (list `assign if-var #f)))))
-          (append e1-vars (list (cons if-var `Boolean)) e2-vars)
-        )]
-      [`(allocate ,size ,type)
-        (define tmpSym (gensym `tmp))
-        (values
-          tmpSym
-          `((assign ,tmpSym ,e))
-          (list (cons tmpSym type)))]
-      [`(vector-ref ,arg ,i-has-type)
-        (match arg
-          [`(has-type ,arg-exp ,arg-type)
+            `(define (,f ,@params) : ,r ,b-vars ,@b-assigns (return ,b-flat))]
+          [`(let ([,x ,v]) ,body)
+            (match v
+              [`(has-type ,v-exp ,v-type)
+                (define-values
+                  (v-flat v-assigns v-vars)
+                  ((flatten-r #f) v))
+                (define-values
+                  (body-flat body-assigns body-vars)
+                  ((flatten-r use-temp) body))
+                (values
+                  body-flat
+                  (append v-assigns `((assign ,x ,v-flat)) body-assigns)
+                  (append v-vars (list (cons x v-type)) body-vars))])]
+          [`(if ,cnd ,thn ,els)
             (define-values
-              (arg-flat arg-assigns arg-vars)
-              ((flatten-r #t) arg-exp))
+              (cnd-flat cnd-assigns cnd-vars)
+              ((flatten-r #t) cnd))
+            (define-values
+              (thn-flat thn-assigns thn-vars)
+              ((flatten-r #t) thn))
+            (define-values
+              (els-flat els-assigns els-vars)
+              ((flatten-r #t) els))
+            (define if-type
+              (match thn
+                [`(has-type ,_ ,type) type]))
+            (let ([if-var (gensym `if)])
+              (values
+                if-var
+                (append cnd-assigns (list
+                  (list `if (list `eq? #t cnd-flat)
+                    (append
+                      thn-assigns
+                      (list (list `assign if-var thn-flat)))
+                    (append
+                      els-assigns
+                      (list (list `assign if-var els-flat))))))
+                (append cnd-vars (list (cons if-var if-type)) thn-vars els-vars)))]
+          [`(and ,e1 ,e2)
+            (define-values
+              (e1-flat e1-assigns e1-vars)
+              ((flatten-r #t) e1))
+            (define-values
+              (e2-flat e2-assigns e2-vars)
+              ((flatten-r #t) e2))
+            (define if-var (gensym `if))
+            (values
+              if-var
+              (append e1-assigns (list
+                (list `if (list `eq? #t e1-flat)
+                  (append
+                    e2-assigns
+                    (list (list `assign if-var e2-flat)))
+                  (list (list `assign if-var #f)))))
+              (append e1-vars (list (cons if-var `Boolean)) e2-vars)
+            )]
+          [`(allocate ,size ,type)
             (define tmpSym (gensym `tmp))
-            (define i
-              (match i-has-type
-                [`(has-type ,num ,_) num]))
-            (define stmt `(vector-ref ,arg-flat ,i))
-            (define stmt-type (list-ref arg-type (+ i 1)))
             (values
               tmpSym
-              (append arg-assigns `((assign ,tmpSym ,stmt)))
-              (cons (cons tmpSym stmt-type) arg-vars))
-            ])]
-      [`(,op ,es ...)
-        (define-values
-          (es-flat es-assigns-list es-vars-list)
-          (map3 (flatten-r #t) es))
-        (let ([es-assigns (append* es-assigns-list)]
-              [es-vars (append* es-vars-list)]
-              [stmt (cons op es-flat)])
-          (cond
-            [use-temp
-              (let ([tmpSym (gensym `tmp)])
+              `((assign ,tmpSym ,exp))
+              (list (cons tmpSym type)))]
+          [`(vector-ref ,arg ,i-has-type)
+            (match arg
+              [`(has-type ,arg-exp ,arg-type)
+                (define-values
+                  (arg-flat arg-assigns arg-vars)
+                  ((flatten-r #t) arg-exp))
+                (define tmpSym (gensym `tmp))
+                (define i
+                  (match i-has-type
+                    [`(has-type ,num ,_) num]))
+                (define stmt `(vector-ref ,arg-flat ,i))
+                (define stmt-type (list-ref arg-type (+ i 1)))
                 (values
                   tmpSym
-                  (append es-assigns `((assign ,tmpSym ,stmt)))
-                  (cons (cons tmpSym (op-return-type op)) es-vars)))]
-            [else
-              (values
-                stmt
-                es-assigns
-                es-vars)]))]
+                  (append arg-assigns `((assign ,tmpSym ,stmt)))
+                  (cons (cons tmpSym stmt-type) arg-vars))
+                ])]
+          [`(,op ,es ...)
+            (println (format "op: ~v" op))
+            (define-values
+              (es-flat es-assigns-list es-vars-list)
+              (map3 (flatten-r #t) es))
+            (let ([es-assigns (append* es-assigns-list)]
+                  [es-vars (append* es-vars-list)]
+                  [stmt (cons op es-flat)])
+              (cond
+                [use-temp
+                  (let ([tmpSym (gensym `tmp)])
+                    (values
+                      tmpSym
+                      (append es-assigns `((assign ,tmpSym ,stmt)))
+                      (cons (cons tmpSym T) es-vars)))]
+                [else
+                  (values
+                    stmt
+                    es-assigns
+                    es-vars)]))])]
       [else (error `flatten-r "flatten could not match ~v" e)]
     )))
 
@@ -472,7 +561,8 @@
   (match op
     [(or `+ `- `read `global-value) `Integer]
     [(or `eq? `< `<= `> `>= `not) `Boolean]
-    [(or `vector-set! `void `collect) `Void]))
+    [(or `vector-set! `void `collect) `Void]
+    [else (error `op-return-type "op not recognized ~v" op)]))
 
 ; input:  (program ([(var . type)|(var Vector type*)]*) (type type) stmt+)
 ; output: (program (var*) (type type) instr+)
@@ -1054,9 +1144,10 @@
 
 (define r4-passes
   `(
-     ; ("typecheck" ,typecheck ,interp-scheme)
-     ; ("uniquify" ,uniquify ,interp-scheme)
-     ; ("expose-allocation" ,expose-allocation ,interp-scheme)
+     ("typecheck" ,typecheck #f)
+     ("uniquify" ,uniquify #f)
+     ("reveal-functions" ,reveal-functions #f)
+     ("expose-allocation" ,expose-allocation #f)
      ; ("flatten" ,flatten ,interp-C)
      ; ("select-instructions" ,select-instructions ,interp-x86)
      ; ("uncover-live" ,uncover-live ,interp-x86)
@@ -1067,3 +1158,17 @@
      ; ("patch-instructions" ,patch-instructions ,interp-x86)
      ; ("print-x86" ,print-x86 #f)
   ))
+
+(define (r4-passes-dev p)
+  (flatten
+  (reveal-functions
+  (uniquify
+  (typecheck
+  p)))))
+
+(define (r4-passes-e p)
+  ; (flatten
+  (reveal-functions
+  (uniquify
+  (typecheck
+  p))))

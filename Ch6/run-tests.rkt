@@ -8,7 +8,7 @@
 
 (interp-tests
     "R4-compiler"           ; name of compiler
-    typecheck               ; type checker or #f to ignore
+    #f               ; type checker or #f to ignore
     r4-passes               ; passes containing methods to test
     interp-scheme           ; interpreter to compare results with
     "r4"                    ; test suite
