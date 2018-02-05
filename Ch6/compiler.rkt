@@ -433,7 +433,7 @@
 
 (define (flatten-r use-temp)
   (lambda (e)
-    (println (format "line: ~v" e))
+    ; (println (format "line: ~v" e))
     (match e
       [`(program (type ,t) (defines ,defines ...) ,body)
         (define-values
@@ -535,7 +535,7 @@
                   (cons (cons tmpSym stmt-type) arg-vars))
                 ])]
           [`(,op ,es ...)
-            (println (format "op: ~v" op))
+            ; (println (format "op: ~v" op))
             (define-values
               (es-flat es-assigns-list es-vars-list)
               (map3 (flatten-r #t) es))
@@ -651,7 +651,39 @@
             (callq collect))]
         [`(void) `((movq (int 0) (var ,var)))]
         [`(global-value ,name) `((movq (global-value ,name) (var ,var)))]
+        [`(function-ref ,f)
+          `((leaq (function-ref ,f) (var ,var)))]
+        [`(app ,f ,args ...)
+          (let loop ([regs `(rdi rsi rdx rcx r8 r9)]
+                     [params (cons `r15 args)]
+                     [output `()]
+                     [used-stack 0])
+            (cond
+              [(empty? params)
+                (append output
+                  `((indirect-callq (var ,f))
+                    (movq (reg rax) (var ,var))))]
+              [(empty? regs)
+                (loop regs (cdr params)
+                  (append output
+                    `((movq ,(C1->x86 (car params)) (deref rsp ,(* 8 used-stack)))))
+                  (+ 1 used-stack))]
+              [else (loop
+                (cdr regs)
+                (cdr params)
+                (append output
+                  `((movq ,(C1->x86 (car params)) (reg ,(car regs)))))
+                used-stack)]))]
       )]
+    [`(define (,f ,params ...) : ,r ,vars ,body ...)
+      `(define (,f) ,(+ 1 (length params))
+        ,(list (append (map car params) (map car vars))
+          (let ([p-length (length params)])
+            (if (> p-length 6)
+                (- p-length 5)
+                0)))
+        ,@(mov-args-to-vars (cons `r15 (map car params)) `(rdi rsi rdx rcx r8 r9) 0)
+        ,@(append* (map select-instructions body)))]
     [`(return ,arg)
       (define a (C1->x86 arg))
       `((movq ,a (reg rax)))]
@@ -661,11 +693,26 @@
            ,@(list (append* (map select-instructions els)))))]
     [`(program ,vars
         (type ,t)
+        (defines ,defines ...)
         ,body ...)
-      `(program ,vars
+      `(program ,(map car vars)
         (type ,t)
+        (defines ,@(map select-instructions defines))
         ,@(append* (map select-instructions body)))]
     ))
+
+(define (mov-args-to-vars vars regs used-stack)
+  ; (println (format "vars: ~v" vars))
+  (cond
+    [(empty? vars) `()]
+    [(empty? regs)
+      (cons
+        `(movq (deref rbp ,(* 8 used-stack)) ,(C1->x86 (car vars)))
+        (mov-args-to-vars (cdr vars) regs (+ 1 used-stack)))]
+    [else
+      (cons
+        `(movq (reg ,(car regs)) ,(C1->x86 (car vars)))
+        (mov-args-to-vars (cdr vars) (cdr regs) used-stack))]))
 
 (define (compute-tag len types)
   ; (((0 + mask) << 6) + len) << 1
@@ -685,6 +732,7 @@
 
 (define (C1->x86 d)
   (cond
+    [(equal? d `r15) `(reg ,d)]
     [(symbol? d) `(var ,d)]
     [(integer? d) `(int ,d)]
     [(boolean? d)
@@ -696,17 +744,25 @@
   (match p
     [`(program ,vars
         (type ,type)
+        (defines ,defines ...)
         ,body ...)
       (define-values
         (live-afters instructions)
         (live-vars (reverse body) (set)))
       `(program
-        ,@(append
-            (list (list
-              vars
-              (append (cdr (reverse live-afters)) `(())))
-              (list `type type))
-            (reverse instructions)))]
+        (,vars
+         ,(cdr (reverse (cons `() live-afters))))
+        (type ,type)
+        (defines ,@(map uncover-live defines))
+        ,@(reverse instructions))]
+    [`(define (,f) ,num-params (,vars ,max-stack) ,body ...)
+      (define-values
+        (live-afters instructions)
+        (live-vars (reverse body) (set)))
+      `(define (,f)
+        ,num-params
+        (,vars ,(cdr (reverse (cons `() live-afters))) ,max-stack)
+        ,@(reverse instructions))]
     [else (error `uncover-live "invalid program received ~v" p)]
   ))
 
@@ -803,6 +859,20 @@
         (values
           (cons (set->list current-live) lives)
           (cons (car e) instructions))]
+      [`(indirect-callq ,arg)
+        (define new-live
+          (add-live-vars arg #t current-live))
+        (define-values (lives instructions) (live-vars (cdr e) new-live))
+        (values
+          (cons (set->list new-live) lives)
+          (cons (car e) instructions))]
+      [`(leaq (function-ref ,_) ,a2)
+        (define new-live
+          (add-live-vars a2 #f current-live))
+        (define-values (lives instructions) (live-vars (cdr e) new-live))
+        (values
+          (cons (set->list new-live) lives)
+          (cons (car e) instructions))]
       [else (error `live-vars "instruction has invalid syntax ~v" (car e))]
   )))
 
@@ -823,16 +893,28 @@
 ; output: (program (var* graph) (type type) instr+)
 (define (build-interference p)
   (match p
-    [`(program (,vars ,live-afters) (type ,type) ,body ...)
-      (let ([graph (make-graph (map car vars))])
+    [`(program (,vars ,live-afters) (type ,type)
+        (defines ,defines ...)
+        ,body ...)
+      (let ([graph (make-graph vars)])
         (map
           (lambda (i l) (build-interference-r i l graph))
           body
           live-afters)
         `(program
-            ,@(append
-                (list (list vars graph) (list `type type))
-                (remove-if-lives body))))]
+          (,vars ,graph)
+          (type ,type)
+          (defines ,@(map build-interference defines))
+          ,@(remove-if-lives body)))]
+    [`(define (,f) ,num-params (,vars ,live-afters ,max-stack) ,body ...)
+      (let ([graph (make-graph vars)])
+        (map
+          (lambda (i l) (build-interference-r i l graph))
+          body
+          live-afters)
+        `(define (,f) ,num-params
+          (,vars ,graph ,max-stack)
+          ,@(remove-if-lives body)))]
     [else (error "invalid program syntax" p)]))
 
 (define (build-interference-r instr live-vars graph)
@@ -876,12 +958,19 @@
           (unless (or (equal? v d) (boolean? d))
             (add-edge graph d v)))
           live-vars))]
+    [`(leaq ,_ ,a2)
+      (let ([d (arg->var a2)])
+        (map (lambda (v)
+          (unless (or (equal? v d) (boolean? d))
+            (add-edge graph d v)))
+          live-vars))]
     [`(cmpq ,_ ,_) "no graph changes needed"]
     [`(set ,_ ,_) "no graph changes needed"]
     [`(jmp ,_) "no graph changes needed"]
     [`(jmp-if ,_ ,_) "no graph changes needed"]
     [`(label ,_) "no graph changes needed"]
     [`(callq ,_) "no graph changes needed"]
+    [`(indirect-callq ,_) "no graph changes needed"]
     [else (error "invalid instruction syntax" instr)]))
 
 (define (remove-if-lives body)
@@ -901,8 +990,10 @@
 ; output: x86_1 -> (program stack-size (type type) instr+)
 (define (allocate-registers p)
   (match p
-    [`(program (,var ,graph) (type ,type) ,body ...)
-      (let ([color-map (color-graph graph (map car var))]
+    [`(program (,var ,graph) (type ,type)
+      (defines ,defines ...)
+      ,body ...)
+      (let ([color-map (color-graph graph var)]
             [m (make-hash)]
             [max-color 0])
         (map (lambda (v)
@@ -910,26 +1001,30 @@
             (cond
               [(equal? color 0) (hash-set! m v `(reg rbx))]
               [else (hash-set! m v (list `deref `rbp (* -8 color)))])
-              ; [(equal? color 0) (hash-set! m v `(reg rdx))]
-              ; [(equal? color 1) (hash-set! m v `(reg rcx))]
-              ; [(equal? color 2) (hash-set! m v `(reg rsi))]
-              ; [(equal? color 3) (hash-set! m v `(reg rdi))]
-              ; [(equal? color 4) (hash-set! m v `(reg r8))]
-              ; [(equal? color 5) (hash-set! m v `(reg r9))]
-              ; [(equal? color 6) (hash-set! m v `(reg r10))]
-              ; [(equal? color 7) (hash-set! m v `(reg r11))]
-              ; [else (hash-set! m v (list `deref `rbp (* -8 (- color 7))))])
             (when (> color max-color)
               (set! max-color color))))
-          (map car var))
-        (cons
-          `program
-          (cons
-            ; (* 8 (if (< (- max-color 7) 0) 0 (- max-color 7)))
-            (* 8 max-color)
-            (cons `(type ,type)
-              (map (assign-homes-r m) body)))))]
-    [else (error "program has invalid syntax" p)]))
+          var)
+        `(program
+          ,(* 8 max-color)
+          (type ,type)
+          (defines ,@(map allocate-registers defines))
+          ,@(map (assign-homes-r m) body)))]
+    [`(define (,f) ,num-params (,var ,graph ,max-stack) ,body ...)
+      (let ([color-map (color-graph graph var)]
+            [m (make-hash)]
+            [max-color 0])
+        (map (lambda (v)
+          (let ([color (hash-ref color-map v)])
+            (cond
+              [(equal? color 0) (hash-set! m v `(reg rbx))]
+              [else (hash-set! m v (list `deref `rbp (* -8 color)))])
+            (when (> color max-color)
+              (set! max-color color))))
+          var)
+        `(define (,f) 
+          ,(* 8 max-color)
+          ,@(map (assign-homes-r m) body)))]
+    [else (error `allocate-registers "program has invalid syntax ~v" p)]))
 
 (define (color-graph g vars)
   (let f ([color (make-hash)] [saturation (make-hash)] [W vars])
@@ -989,6 +1084,7 @@
       [`(byte-reg ,_) e]
       [`(deref ,_ ,_) e]
       [`(global-value ,_) e]
+      [`(function-ref ,_) e]
       ; instr
       [`(set ,_ ,_) e]
       [`(callq ,_) e]
@@ -1008,8 +1104,11 @@
 ; output: x86_1 -> (program stack-size (type type) instr+)
 (define (lower-conditionals e)
   (match e
-    [`(program ,stack-size (type ,type) ,body ...)
+    [`(program ,stack-size (type ,type)
+      (defines ,defines ...)
+      ,body ...)
       `(program ,stack-size (type ,type)
+        (defines ,@(map lower-conditionals defines))
         ,@(append* (map lower-conditionals body)))]
     [`(if (eq? ,arg1 ,arg2) ,thns ,elss)
       (define thenlabel (gensym `thenlabel))
@@ -1022,6 +1121,9 @@
           (label ,thenlabel))
         (append* (map lower-conditionals thns))
         `((label ,endlabel)))]
+    [`(define (,f) ,stack-size ,body ...)
+      `(define (,f) ,stack-size
+        ,@(append* (map lower-conditionals body)))]
     [else (list e)]
   ))
 
@@ -1031,9 +1133,13 @@
   (define e-new (remove-double-stack-ref e))
   (if (not e-new)
       (match e
-        [`(program ,size (type ,type) ,body ...)
-          (cons `program (cons size (cons `(type ,type)
-            (append* (map patch-instructions body)))))]
+        [`(program ,size (type ,type)
+            (defines ,defines ...) ,body ...)
+          `(program ,size (type ,type)
+            (defines ,@(map patch-instructions defines))
+            ,@(append* (map patch-instructions body)))]
+        [`(define (,f) ,stack-size ,body ...)
+          `(define (,f) ,stack-size ,@(append* (map patch-instructions body)))]
         [`(movq ,a1 ,a2)
           (if (equal? a1 a2)
               (list)
@@ -1042,6 +1148,12 @@
           (match a2
             [`(deref ,reg ,offset)
               `((movzbq ,a1 (reg rax))
+                (movq (reg rax) (deref ,reg ,offset)))]
+            [else (list e)])]
+        [`(leaq ,a1 ,a2)
+          (match a2
+            [`(deref ,reg ,offset)
+              `((leaq ,a1 (reg rax))
                 (movq (reg rax) (deref ,reg ,offset)))]
             [else (list e)])]
         [`(cmpq ,a1 ,a2)
@@ -1072,8 +1184,10 @@
 ; output: x86
 (define (print-x86 e)
   (match e
-    [`(program ,size (type ,type) ,body ...)
+    [`(program ,size (type ,type)
+        (defines ,defines ...) ,body ...)
       (string-append
+        (string-join (map print-x86 defines) "\n\n")
         "    .globl main\n"
         "main:\n"
         (if (> size 0)
@@ -1089,7 +1203,7 @@
         "    movq    rootstack_begin(%rip), %r15\n"
         "    movq    $0, (%r15)\n"
         ; "    addq    $0, %r15\n"
-        "\n    "
+        "\n"
         (string-join (map print-x86 body) "\n") "\n"
         "\n"
         (print-by-type type)
@@ -1101,7 +1215,27 @@
               "    popq    %rbp\n")
             "")
         "    popq    %rbx\n"
-        "    retq"
+        "    retq\n"
+      )]
+    [`(define (,f) ,stack-size ,body ...)
+      (string-append
+        (format "    .globl ~a\n" f)
+        (format "~a:\n" f)
+        "    pushq   %rbp\n"
+        "    pushq   %rbx\n"
+        "    movq    %rsp, %rbp\n"
+        (if (> stack-size 0)
+          (format "    subq    $~v, %rsp\n" stack-size)
+          "")
+        "\n"
+        (string-join (map print-x86 body) "\n") "\n"
+        "\n"
+        (if (> stack-size 0)
+          (format "    addq    $~v, %rsp\n" stack-size)
+          "")
+        "    popq    %rbx\n"
+        "    popq    %rbp\n"
+        "    retq\n"
       )]
 
     ; instr
@@ -1127,6 +1261,10 @@
       (format "~a:" label)]
     [`(callq ,label)
       (format "    callq   ~a" label)]
+    [`(indirect-callq ,arg)
+      (format "    callq   *~a" (print-x86 arg))]
+    [`(leaq ,a1 ,a2)
+      (format "    leaq    ~a, ~a" (print-x86 a1) (print-x86 a2))]
 
     ; args
     [`(int ,num)
@@ -1139,6 +1277,8 @@
       (format "~a(%~a)" offset reg)]
     [`(global-value ,name)
       (format "~a(%rip)" name)]
+    [`(function-ref ,label)
+      (format "~a(%rip)" label)]
     [else (error `print-x86 "invalid grammar ~v" e)]
   ))
 
@@ -1160,11 +1300,12 @@
   ))
 
 (define (r4-passes-dev p)
+  (select-instructions
   (flatten
   (reveal-functions
   (uniquify
   (typecheck
-  p)))))
+  p))))))
 
 (define (r4-passes-e p)
   ; (flatten
