@@ -20,7 +20,7 @@
 
 (define (typecheck-r env)
   (lambda (e)
-    ; (` (format "top-exp: ~v" e))
+    (println (format "top-exp: ~v" e))
     (define recur (typecheck-r env))
     (match e
       [(? fixnum?) (values `(has-type ,e Integer) `Integer)]
@@ -150,16 +150,17 @@
         ; (println (format "func-exp: ~v" e))
         ; (println (format "func-env: ~v" env))
         (define-values (args_e args_T) (map2 recur args))
+        (define-values (f_e f_T) (recur f))
         (define f-types
-          (reverse (cddr (reverse (lookup f env)))))
+          (reverse (cddr (reverse f_T))))
         (define f-return-type
-          (last (lookup f env)))
+          (last f_T))
         (unless (equal? args_T f-types)
           (error `typecheck-r
             "function ~v expected types ~v but received types ~v"
             f f-types args_T))
         (values
-          `(has-type (,f ,@args_e) ,f-return-type)
+          `(has-type (,f_e ,@args_e) ,f-return-type)
           f-return-type)]
       )))
 
@@ -262,6 +263,7 @@
         (define new-funcs (hash-copy funcs))
         (hash-set! new-funcs x (get-type e))
         `(let ([,x ,(recur e)])
+          ; ,(recur body))]
           ,(if (is-func e)
             ((reveal-functions-r new-funcs) body)
             (recur body)))]
@@ -1165,6 +1167,29 @@
         [else (list e)])
       e-new))
 
+(define (patch-func-bug p)
+  (match p
+    [`(program ,size (type ,type)
+        (defines ,defines ...) ,body ...)
+      ((patch-func-bug-r (list->set (map caadr defines))) p)]))
+
+(define (patch-func-bug-r funcs)
+  (lambda (e)
+    (define recur (patch-func-bug-r funcs))
+    (match e
+      [`(program ,size (type ,type)
+          (defines ,defines ...) ,body ...)
+        `(program ,size (type ,type)
+          (defines ,@(map recur defines))
+          ,@(append* (map recur body)))]
+      [`(define (,f) ,stack-size ,body ...)
+        `(define (,f) ,stack-size ,@(append* (map recur body)))]
+      [`(leaq (function-ref ,label) ,arg)
+        (if (set-member? funcs label)
+          (list e)
+          `())]
+      [else (list e)])))
+
 (define (remove-double-stack-ref e)
   (match e
     [`(,op ,a1 ,a2)
@@ -1186,7 +1211,7 @@
   (match e
     [`(program ,size (type ,type)
         (defines ,defines ...) ,body ...)
-      (string-append
+      (string-replace (string-append
         (string-join (map print-x86 defines) "\n\n")
         "    .globl main\n"
         "main:\n"
@@ -1216,7 +1241,7 @@
             "")
         "    popq    %rbx\n"
         "    retq\n"
-      )]
+      ) "?" "question")]
     [`(define (,f) ,stack-size ,body ...)
       (string-append
         (format "    .globl ~a\n" f)
@@ -1284,19 +1309,20 @@
 
 (define r4-passes
   `(
-     ("typecheck" ,typecheck #f)
-     ("uniquify" ,uniquify #f)
-     ("reveal-functions" ,reveal-functions #f)
-     ("expose-allocation" ,expose-allocation #f)
-     ; ("flatten" ,flatten ,interp-C)
-     ; ("select-instructions" ,select-instructions ,interp-x86)
-     ; ("uncover-live" ,uncover-live ,interp-x86)
-     ; ("build-interference" ,build-interference ,interp-x86)
-     ; ("allocate-registers" ,allocate-registers ,interp-x86)
+     ; ("typecheck" ,typecheck #f)
+     ("uniquify" ,uniquify ,interp-scheme)
+     ("reveal-functions" ,reveal-functions ,interp-scheme)
+     ; ("expose-allocation" ,expose-allocation ,interp-scheme)
+     ("flatten" ,flatten ,interp-C)
+     ("select-instructions" ,select-instructions ,interp-x86)
+     ("uncover-live" ,uncover-live ,interp-x86)
+     ("build-interference" ,build-interference ,interp-x86)
+     ("allocate-registers" ,allocate-registers ,interp-x86)
      ; ; ("assign-homes" ,assign-homes ,interp-x86)
-     ; ("lower-conditionals" ,lower-conditionals ,interp-x86)
-     ; ("patch-instructions" ,patch-instructions ,interp-x86)
-     ; ("print-x86" ,print-x86 #f)
+     ("lower-conditionals" ,lower-conditionals ,interp-x86)
+     ("patch-instructions" ,patch-instructions ,interp-x86)
+     ("patch-func-bug" ,patch-func-bug ,interp-x86)
+     ("print-x86" ,print-x86 #f)
   ))
 
 (define (r4-passes-dev p)
